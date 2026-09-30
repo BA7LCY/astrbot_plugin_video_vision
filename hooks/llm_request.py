@@ -1,30 +1,32 @@
-"""``on_llm_request`` 钩子：把视频作为原生模态注入请求。
+"""``on_llm_request`` 钩子：让模型真正“看到”视频。
 
-为什么是钩子而不是 provider 适配器
+两种工作模式（``provider_mode``）
 ----------------------------------
-AstrBot 主对话轮次的上下文由 **``ProviderRequest.assemble_context()``**
-（``core/provider/entities.py``）组装，而 runner 调用 provider 时传的是
-``contexts=`` 且 **``prompt=None``**（``tool_loop_agent_runner.py``）。
-而 ``ProviderGoogleGenAI.text_chat`` 只在 ``prompt is not None`` 时才调用
-provider 侧的 ``assemble_context``（``gemini_source.py``）。
+``gemini_native``（原路径）
+    把视频转成内容块注入当前请求。主对话轮次的上下文由
+    ``ProviderRequest.assemble_context()``（``core/provider/entities.py``）组装，
+    runner 传 ``contexts=`` 且 ``prompt=None``，而 provider 侧的
+    ``assemble_context`` 只在 ``prompt is not None`` 时才被调用 ——
+    所以覆写 provider 在主对话轮次上**永远不会被调用**，必须在钩子阶段把视频块
+    追加进 ``req.extra_user_content_parts``。该字段会被
+    ``ProviderRequest.assemble_context()`` 原样透传，最终在
+    ``gemini_source._prepare_conversation`` 里经 ``process_audio_url``
+    构造成 ``Part.from_bytes(mime_type="video/mp4")``。
 
-因此覆写 provider 的 ``assemble_context`` **在主对话轮次上永远不会被调用** ——
-只有图片描述、TTS 后处理等辅助调用会走到那里。
+``openai_compat``（本版本新增）
+    插件自己把视频发给配置里的 OpenAI 兼容视觉服务（``analyze_videos``）做理解，
+    再把理解结果作为**文字**注入请求。主对话 provider 可以是任意模型。
+    线上格式踩坑见 ``core/openai_vision.py`` 的模块说明：实测只有
+    ``image_url + data:video/*;base64,...`` 这一种形态会被端点按视频处理。
 
-正确做法是在 ``on_llm_request`` 阶段把视频块追加进
-``req.extra_user_content_parts``。该字段的内容会被
-``ProviderRequest.assemble_context()`` 原样透传，最终在
-``gemini_source._prepare_conversation`` 的 ``else`` 分支里交给
-``process_audio_url`` 构造成 ``Part.from_bytes(mime_type="video/mp4")``。
-
-三个必须遵守的约束（来自对陪伴插件的兼容性审计）
-------------------------------------------------
+三个必须遵守的约束（来自对陪伴插件的兼容性审计，两种模式都适用）
+------------------------------------------------------------------
 1. **必须标记为非持久化**（``mark_as_temp()``）。否则多兆的 base64 会写进
    对话历史，并在之后**每一轮**被重发 —— token 与成本爆炸、数据库膨胀。
    ``message.py`` 的 ``dump_messages_with_checkpoints`` 会丢弃 ``_no_save`` 的 part。
-2. **用 ``AudioURLPart`` 对象而不是裸 dict**。provider 侧的 ``assemble_context``
-   对非 ``TextPart``/``ImageURLPart``/``AudioURLPart`` 的 part 会 **raise ValueError**；
-   而 ``ProviderRequest`` 侧两者都接受。用对象两边都安全。
+2. gemini_native 模式**用 ``AudioURLPart`` 对象而不是裸 dict**：provider 侧的
+   ``assemble_context`` 对非 ``TextPart``/``ImageURLPart``/``AudioURLPart`` 的
+   part 会 raise ValueError；``ProviderRequest`` 侧两者都接受，用对象两边都安全。
 3. **不要缓存 ``req.extra_user_content_parts`` 的列表引用**。陪伴插件会在多个
    钩子里把它替换成新列表；每次读写都重新取一次属性。
 """
@@ -33,13 +35,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from astrbot.api import logger
 
 from ..core.config import VideoConfig
 from ..core.injector import prepare_video
-from ..core.placeholder import iter_placeholders, parse_placeholder_text
+from ..core.openai_vision import analyze_videos
+from ..core.placeholder import (
+    iter_placeholders,
+    parse_placeholder_text,
+)
 
 try:
     from astrbot.core.agent.message import AudioURLPart
@@ -48,7 +55,7 @@ except Exception:  # pragma: no cover - 版本差异兜底
 
 #: 判定为「Gemini 系」的 provider 类型 —— 只有它们才会把 audio_url 块按 MIME
 #: 构造成媒体 Part（``process_audio_url`` 是 MIME 无关的）。其他 provider 会把
-#: 视频当音频处理，因此默认拦住。
+#: 视频当音频处理，因此默认拦住。仅 gemini_native 模式使用。
 GEMINI_PROVIDER_TYPES: frozenset[str] = frozenset(
     {
         "googlegenai_chat_completion",
@@ -60,6 +67,7 @@ GEMINI_PROVIDER_TYPES: frozenset[str] = frozenset(
 _DONE_ATTR = "_video_vision_injected"
 _warned_modality: set[str] = set()
 _warned_gate: set[str] = set()
+_warned_config: set[str] = set()
 
 
 def _short_reason(reason: str) -> str:
@@ -80,6 +88,14 @@ def _short_reason(reason: str) -> str:
         return "compression failed"
     if "拒绝" in reason or "闸门" in reason or "too large" in low:
         return "it exceeds the size limit"
+    if "ssl" in low or "证书" in reason:
+        return "vision service SSL certificate check failed"
+    if "超时" in reason or "timeout" in low or "timed out" in low:
+        return "the vision service timed out"
+    if "连接" in reason or "connect" in low:
+        return "the vision service is unreachable"
+    if "http" in low:
+        return "the vision service returned an error"
     return "it could not be processed"
 
 
@@ -90,7 +106,7 @@ def _parts_of(req: Any) -> list[Any]:
 
 
 def _temp_video_part(data_uri: str) -> Any:
-    """构造一个**不持久化**的视频内容块。
+    """构造一个**不持久化**的视频内容块（gemini_native 模式用）。
 
     借道 ``audio_url`` 是刻意为之：``process_audio_url`` 从 data URI 里取 MIME
     再交给 ``Part.from_bytes``，因此 ``data:video/mp4`` 会被构造成视频 Part。
@@ -128,8 +144,8 @@ async def build_video_blocks(
     *,
     config: VideoConfig,
     cache_root: str,
-) -> tuple[list[Any], set[int], list[str]]:
-    """扫描占位符并准备视频内容块。
+) -> tuple[list[tuple[int, str, Any]], set[int], list[str]]:
+    """扫描占位符并准备视频（探测/压缩/编码），两种模式共用这一段管线。
 
     **每个视频的处理都放到线程池执行**。``prepare_video`` 是同步的，内部会跑
     ffmpeg 子进程并做文件 I/O；若直接在事件循环里调用，一次最长
@@ -137,11 +153,12 @@ async def build_video_blocks(
     期间所有会话的消息都不被处理。
 
     Returns:
-        (待追加的内容块列表, 已成功注入的占位符下标, 失败原因短语列表)
+        (已备好的视频列表 [(占位符下标, 文件名, VideoInjection), ...],
+         占位符下标集合, 失败原因短语列表)
     """
     found = iter_placeholders(parts)
     if not found:
-        return [], []
+        return [], set(), []
 
     total_found = len(found)
 
@@ -163,7 +180,7 @@ async def build_video_blocks(
         )
     found = [(i, p) for i, p in found if _is_video_candidate(p)]
     if not found:
-        return [], []
+        return [], set(), []
 
     # ---- 闸门 1：引用视频 ----
     # 先按策略过滤，再套用数量上限 —— 否则被跳过的引用视频会白占配额，
@@ -172,13 +189,12 @@ async def build_video_blocks(
         found = [(i, p) for i, p in found if not p.quoted]
         if not found:
             logger.debug("[VideoVision] 仅有引用视频且配置为不处理，跳过")
-            return [], []
+            return [], set(), []
 
     limit = config.max_video_count
     if limit <= 0:
         logger.debug("[VideoVision] max_video_count=0，跳过全部视频")
-        return [], []
-
+        return [], set(), []
     selected = found[:limit]
     if len(found) > len(selected):
         logger.info(
@@ -194,9 +210,9 @@ async def build_video_blocks(
             total_found - len(found),
         )
 
-    blocks: list[Any] = []
-    failures: list[str] = []
+    prepared: list[tuple[int, str, Any]] = []
     consumed: set[int] = set()
+    failures: list[str] = []
     seen_paths: set[str] = set()
 
     for index, placeholder in selected:
@@ -217,10 +233,10 @@ async def build_video_blocks(
         )
         if outcome.ok and outcome.injection is not None:
             inj = outcome.injection
-            blocks.append(_temp_video_part(inj.data_uri))
+            prepared.append((index, placeholder.name, inj))
             consumed.add(index)
             logger.info(
-                "[VideoVision] 视频已注入: %s | %s | %.2fMB -> %.2fMB | %.1fs | %s%s",
+                "[VideoVision] 视频已备好: %s | %s | %.2fMB -> %.2fMB | %.1fs | %s%s",
                 placeholder.name,
                 inj.action,
                 _safe_size(inj.source_path),
@@ -235,23 +251,37 @@ async def build_video_blocks(
                 "[VideoVision] 视频未注入: %s | %s", placeholder.name, outcome.reason
             )
 
-    return blocks, consumed, failures
+    return prepared, consumed, failures
 
 
-def _neutralize_placeholders(parts: list[Any], consumed: set[int]) -> int:
-    """把已成功注入的占位文本改写成**不含本机路径**的形式。
+_NEUTRALIZE_TEXT = {
+    "gemini_native": (
+        "[视频内容已随本消息直接提供（文件名 {name}）。"
+        "你已经在本次请求中看到了这段视频，无需再用任何工具去查找或读取该文件。]"
+    ),
+    "openai_compat": (
+        "[视频 {name} 已交给视觉模型分析，分析结果已随本消息以文字形式提供。"
+        "你无需、也无法读取该视频文件，不要尝试用代码工具去解析它。]"
+    ),
+}
+
+
+def _neutralize_placeholders(
+    parts: list[Any], consumed: set[int], *, mode: str = "gemini_native"
+) -> int:
+    """把已成功处理的占位文本改写成**不含本机路径**的形式。
 
     实测动机：核心产出的是 ``[File Attachment: name X, path C:\\...\\X.mp4]``，
-    把本机绝对路径直接喂给了模型。模型是 agentic 的 —— 看到路径就会自己去跑
+    会把本机绝对路径直接喂给模型。模型是 agentic 的 —— 看到路径就会自己去跑
     ``astrbot_execute_python`` + ``cv2`` 抽帧、grep 知识库、web search，
-    而**它本来已经拿到视频了**。实测日志：
+    而**它本来已经拿到视频内容了**。实测日志：
 
         05:04:17  [VideoVision] 视频已注入 ... 6.16MB
         05:05:45  使用工具：astrbot_execute_python {'code': 'import cv2...'}
         05:05:46  Result: FPS: 30.0, Frame count: 87
 
     改写后模型仍知道「有个视频、叫什么名字」，但不再被路径诱导去自己动手。
-    仅改写**已成功注入**的那些占位符；注入失败的原样保留（那时路径反而有用）。
+    仅改写**已成功处理**的那些占位符；失败的原样保留（那时路径反而有用）。
 
     第二轮实测补充：只去掉路径还不够。模型**仍在按文件名搜整个磁盘**：
 
@@ -259,10 +289,12 @@ def _neutralize_placeholders(parts: list[Any], consumed: set[int]) -> int:
         for root, dirs, files in os.walk(<用户主目录>): ...
 
     说明它把 ``[Video: X.mp4]`` 理解成「有个文件，我得去读它」，而没意识到
-    **视频内容已经作为原生模态直接给它了**。因此改写文本必须同时说明这一点。
+    **视频内容已经直接给它了**。因此改写文本必须同时说明这一点 ——
+    两种模式的文案不同（原生已看见 vs 已由视觉服务分析）。
     """
     if not consumed:
         return 0
+    template = _NEUTRALIZE_TEXT.get(mode, _NEUTRALIZE_TEXT["gemini_native"])
     changed = 0
     for index in sorted(consumed):
         if not (0 <= index < len(parts)):
@@ -278,10 +310,7 @@ def _neutralize_placeholders(parts: list[Any], consumed: set[int]) -> int:
         if placeholder is None:
             continue
         name = placeholder.name or "attachment"
-        replacement = (
-            f"[视频内容已随本消息直接提供（文件名 {name}）。"
-            "你已经在本次请求中看到了这段视频，无需再用任何工具去查找或读取该文件。]"
-        )
+        replacement = template.replace("{name}", name)
         try:
             if is_dict:
                 part["text"] = replacement
@@ -310,6 +339,67 @@ async def _resolve_provider(plugin: Any, event: Any) -> Any:
         return None
 
 
+_ATTACHMENT_PREFIXES = ("[Video Attachment", "[File Attachment")
+
+
+def _extract_question(event: Any, req: Any) -> str:
+    """提取用户这条消息里随视频附带的文字（可能为空）。
+
+    依次尝试：event.get_message_str() -> event.message_str -> req.prompt
+    -> req.contexts 里最后一条 user 文本。附件占位行会被剔除，
+    避免把「[Video Attachment: ...]」当作用户问题带给视觉模型。
+    """
+    text = ""
+    getter = getattr(event, "get_message_str", None)
+    if callable(getter):
+        try:
+            text = str(getter() or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+    if not text:
+        text = str(getattr(event, "message_str", "") or "")
+    if not text:
+        prompt = getattr(req, "prompt", None)
+        if isinstance(prompt, str):
+            text = prompt
+    if not text:
+        contexts = getattr(req, "contexts", None) or []
+        try:
+            for message in reversed(list(contexts)):
+                if not isinstance(message, Mapping):
+                    continue
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    text = content
+                    break
+                if isinstance(content, list):
+                    text = " ".join(
+                        str(part.get("text") or "")
+                        for part in content
+                        if isinstance(part, Mapping) and part.get("type") == "text"
+                    )
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().startswith(_ATTACHMENT_PREFIXES)
+    ]
+    return "\n".join(lines).strip()[:600]
+
+
+def _wrap_vision_analysis(name: str, analysis: str, model: str) -> str:
+    """把视觉模型的回答包装成注入给主模型的参考材料。"""
+    return (
+        f"[视频「{name}」已由视觉模型 {model} 观看并分析，结果如下：\n"
+        f"{analysis}\n"
+        "—— 若用户的问题与该视频有关，请基于以上分析回答；"
+        "分析未覆盖的细节如实说明不确定，不要编造。]"
+    )
+
 async def handle_llm_request(plugin: Any, event: Any, req: Any) -> None:
     """钩子入口。任何异常都在内部消化，绝不打断对话。"""
     try:
@@ -329,58 +419,116 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     if not iter_placeholders(_parts_of(req)):
         return
 
-    provider = await _resolve_provider(plugin, event)
-    provider_config = getattr(provider, "provider_config", None) or {}
-    provider_type = str(provider_config.get("type") or "")
+    mode = config.provider_mode
+    provider_type = "(openai_compat)"
 
-    # ---- 闸门 1：必须是 Gemini 系 provider ----
-    if config.require_gemini_provider and provider_type not in GEMINI_PROVIDER_TYPES:
-        if provider_type not in _warned_gate:
-            _warned_gate.add(provider_type)
-            logger.warning(
-                "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，已跳过视频注入。"
-                "若该 provider 同样支持按 MIME 构造媒体 Part，"
-                "可在插件配置里关闭 require_gemini_provider。",
-                provider_type or "(未知)",
-            )
-        return
+    if mode == "gemini_native":
+        provider = await _resolve_provider(plugin, event)
+        provider_config = getattr(provider, "provider_config", None) or {}
+        provider_type = str(provider_config.get("type") or "")
 
-    # ---- 闸门 2：模型必须声明 audio 模态 ----
-    # 视频块借道 audio_url，而 modality 清洗会把未声明的 audio 块替换成
-    # "[Audio]" 文本，那样视频就白传了。
-    modalities = provider_config.get("modalities")
-    if isinstance(modalities, list) and modalities and "audio" not in modalities:
-        key = f"{provider_type}:{provider_config.get('id') or ''}"
-        if key not in _warned_modality:
-            _warned_modality.add(key)
-            logger.warning(
-                "[VideoVision] 模型 %s 的 modalities 未包含 audio，视频块会被清洗成文本。"
-                "请在 WebUI 给该模型勾选「音频」模态后重试。",
-                provider_config.get("id") or provider_type,
-            )
-        return
+        # ---- 闸门 1：必须是 Gemini 系 provider ----
+        if (
+            config.require_gemini_provider
+            and provider_type not in GEMINI_PROVIDER_TYPES
+        ):
+            if provider_type not in _warned_gate:
+                _warned_gate.add(provider_type)
+                logger.warning(
+                    "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，已跳过视频注入。"
+                    "若该 provider 同样支持按 MIME 构造媒体 Part，"
+                    "可在插件配置里关闭 require_gemini_provider。",
+                    provider_type or "(未知)",
+                )
+            return
+
+        # ---- 闸门 2：模型必须声明 audio 模态 ----
+        # 视频块借道 audio_url，而 modality 清洗会把未声明的 audio 块替换成
+        # "[Audio]" 文本，那样视频就白传了。
+        modalities = provider_config.get("modalities")
+        if isinstance(modalities, list) and modalities and "audio" not in modalities:
+            key = f"{provider_type}:{provider_config.get('id') or ''}"
+            if key not in _warned_modality:
+                _warned_modality.add(key)
+                logger.warning(
+                    "[VideoVision] 模型 %s 的 modalities 未包含 audio，视频块会被清洗成文本。"
+                    "请在 WebUI 给该模型勾选「音频」模态后重试。",
+                    provider_config.get("id") or provider_type,
+                )
+            return
+    else:
+        # ---- openai_compat：只校验视觉服务三要素，不关心主对话 provider ----
+        if not config.openai_service_ready:
+            key = "openai_compat_not_ready"
+            if key not in _warned_config:
+                _warned_config.add(key)
+                logger.warning(
+                    "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
+                    "openai_api_key / openai_model 未配齐，视频注入已跳过。"
+                )
+            return
 
     setattr(req, _DONE_ATTR, True)
 
-    # ---- 准备（同步，无 await）----
+    # ---- 准备（探测/压缩在线程池，无独立 await）----
     cache_root = str(getattr(plugin, "cache_root", "") or "")
     if config.debug_log:
         logger.info(
-            "[VideoVision][debug] 钩子触发 | umo=%s provider=%s 候选占位符=%d",
+            "[VideoVision][debug] 钩子触发 | umo=%s 模式=%s provider=%s 候选占位符=%d",
             getattr(event, "unified_msg_origin", "?"),
+            mode,
             provider_type,
             len(iter_placeholders(_parts_of(req))),
         )
-    blocks, consumed, failures = await build_video_blocks(
+    prepared, _, failures = await build_video_blocks(
         _parts_of(req), config=config, cache_root=cache_root
     )
+
+    # ---- 模式分支：原生注入 vs 视觉服务理解 ----
+    blocks: list[Any] = []
+    done_indices: set[int] = set()
+
+    if mode == "gemini_native":
+        for index, _name, inj in prepared:
+            blocks.append(_temp_video_part(inj.data_uri))
+            done_indices.add(index)
+    else:
+        if prepared:
+            question = _extract_question(event, req)
+            if config.debug_log:
+                logger.info(
+                    "[VideoVision][debug] 视觉服务调用 | 视频=%d 附带问题=%s",
+                    len(prepared),
+                    (question[:80] + "…") if len(question) > 80 else (question or "(无)"),
+                )
+            results = await analyze_videos(
+                [(name, inj.data_uri) for _i, name, inj in prepared],
+                question,
+                config=config,
+                logger=logger,
+            )
+            for (index, name, _inj), result in zip(prepared, results):
+                if result.ok:
+                    blocks.append(
+                        _temp_text_part(
+                            _wrap_vision_analysis(
+                                name, result.analysis, config.openai_model
+                            )
+                        )
+                    )
+                    done_indices.add(index)
+                else:
+                    failures.append(_short_reason(result.reason))
+                    logger.warning(
+                        "[VideoVision] 视觉理解失败: %s | %s", name, result.reason
+                    )
 
     # ---- 重新读取后再写入，避免期间列表被替换 ----
     target = _parts_of(req)
     if blocks:
-        # 注入成功后抹掉占位文本里的本机路径，避免诱导模型自己去跑 Python/cv2
+        # 处理成功后抹掉占位文本里的本机路径，避免诱导模型自己去跑 Python/cv2
         if config.hide_local_path:
-            changed = _neutralize_placeholders(target, consumed)
+            changed = _neutralize_placeholders(target, done_indices, mode=mode)
             if changed and config.debug_log:
                 logger.info(
                     "[VideoVision][debug] 已抹除 %d 处占位文本中的本机路径", changed

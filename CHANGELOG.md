@@ -1,5 +1,26 @@
 # 更新日志
 
+## 0.2.0
+
+新增 **openai_compat 模式**：配置文件可自定义 OpenAI 兼容视觉服务商。
+
+- 新配置项：`provider_mode`（`openai_compat` / `gemini_native`，默认 `openai_compat`）、
+  `openai_base_url` / `openai_api_key` / `openai_model` / `openai_timeout_sec` /
+  `openai_max_tokens` / `vision_with_question` / `vision_describe_prompt` /
+  `vision_qa_prompt` / `vision_verify_ssl`
+- openai_compat 模式下，插件直接把视频发给自己配置的视觉服务做理解，
+  再把结果以文字注入对话，**主对话模型可以是任意模型**，不再要求 Gemini provider
+- 用户发视频时附带的文字会一起发给视觉模型，得到针对性理解（`vision_with_question`）
+- 实测踩坑（2026-09-29，Gemini 系中转站）：OpenAI 兼容接口上视频只有以
+  `image_url + data:video/*;base64,...` 形态发送才生效；`video_url` / `file` /
+  `input_video` 三种形态均返回 HTTP 200 但视频被静默丢弃（prompt token 不变）。
+  插件已按实测结论实现，细节见 `core/openai_vision.py` 模块说明
+- 部分中转站证书链在 Python 下过不了校验（浏览器/PowerShell 正常），
+  可用 `vision_verify_ssl` 开关处理
+- `/videotest` 在 openai_compat 模式下会**真实调用一次视觉服务**，端到端验证配置与网络
+- gemini_native 路径行为完全保留，`require_gemini_provider` 仅对该模式生效
+
+
 ## 0.1.2
 
 - 启动日志打印的版本号改为从 `metadata.yaml` 读取，不再硬编码，避免与发布版本脱节
