@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover - 版本差异兜底
 
 #: 判定为「Gemini 系」的 provider 类型 —— 只有它们才会把 audio_url 块按 MIME
 #: 构造成媒体 Part（``process_audio_url`` 是 MIME 无关的）。其他 provider 会把
-#: 视频当音频处理，因此默认拦住。
+#: 视频当音频处理，因此默认拦住；可用配置 ``additional_provider_types`` 额外放行。
 GEMINI_PROVIDER_TYPES: frozenset[str] = frozenset(
     {
         "googlegenai_chat_completion",
@@ -141,7 +141,7 @@ async def build_video_blocks(
     """
     found = iter_placeholders(parts)
     if not found:
-        return [], []
+        return [], set(), []
 
     total_found = len(found)
 
@@ -163,7 +163,7 @@ async def build_video_blocks(
         )
     found = [(i, p) for i, p in found if _is_video_candidate(p)]
     if not found:
-        return [], []
+        return [], set(), []
 
     # ---- 闸门 1：引用视频 ----
     # 先按策略过滤，再套用数量上限 —— 否则被跳过的引用视频会白占配额，
@@ -172,12 +172,12 @@ async def build_video_blocks(
         found = [(i, p) for i, p in found if not p.quoted]
         if not found:
             logger.debug("[VideoVision] 仅有引用视频且配置为不处理，跳过")
-            return [], []
+            return [], set(), []
 
     limit = config.max_video_count
     if limit <= 0:
         logger.debug("[VideoVision] max_video_count=0，跳过全部视频")
-        return [], []
+        return [], set(), []
 
     selected = found[:limit]
     if len(found) > len(selected):
@@ -333,14 +333,23 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     provider_config = getattr(provider, "provider_config", None) or {}
     provider_type = str(provider_config.get("type") or "")
 
-    # ---- 闸门 1：必须是 Gemini 系 provider ----
-    if config.require_gemini_provider and provider_type not in GEMINI_PROVIDER_TYPES:
+    # ---- 闸门 1：必须是 Gemini 系 provider（可配置额外放行）----
+    allowed_provider_types = GEMINI_PROVIDER_TYPES | set(
+        config.additional_provider_types
+    )
+    if config.require_gemini_provider and provider_type not in allowed_provider_types:
+        logger.debug(
+            "[VideoVision] provider 类型 %r 不在允许列表 %s 中，跳过视频注入",
+            provider_type or "(未知)",
+            sorted(allowed_provider_types),
+        )
         if provider_type not in _warned_gate:
             _warned_gate.add(provider_type)
             logger.warning(
                 "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，已跳过视频注入。"
                 "若该 provider 同样支持按 MIME 构造媒体 Part，"
-                "可在插件配置里关闭 require_gemini_provider。",
+                "可在插件配置里关闭 require_gemini_provider，"
+                "或在 additional_provider_types 中放行该类型。",
                 provider_type or "(未知)",
             )
         return

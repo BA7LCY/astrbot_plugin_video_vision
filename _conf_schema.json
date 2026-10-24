@@ -11,6 +11,13 @@
     "default": true,
     "hint": "强烈建议保持开启。本插件借道 audio_url 内容块传输视频，依赖 Gemini provider 的「按 MIME 构造媒体 Part」行为；其他 provider 会把视频当音频处理。除非你确认目标 provider 行为一致，否则不要关闭。"
   },
+  "additional_provider_types": {
+    "description": "额外允许注入视频的 provider type",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": [],
+    "hint": "在默认 Gemini 系白名单之外，额外放行哪些 provider type。例如把走 OpenAI 协议的 Gemini 代理（openai_chat_completion）填进来；填错可导致上游 422（OpenAI 端点会把视频块序列化成 input_audio 并拒收）。留空时行为与旧版完全一致，仅在 require_gemini_provider 开启时作为补充白名单。"
+  },
   "max_size_mb": {
     "description": "体积闸门（MB）",
     "type": "float",

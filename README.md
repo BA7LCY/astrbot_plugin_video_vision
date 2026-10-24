@@ -43,6 +43,7 @@
 |---|---|---|
 | `enable` | `true` | 总开关 |
 | `require_gemini_provider` | `true` | 仅在 Gemini 系 provider 上注入。**建议保持开启** |
+| `additional_provider_types` | `[]` | 在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
 | `max_size_mb` | `13.0` | 体积闸门，超过则按 `oversize_action` 处理 |
 | `compress_max_mb` | `8.0` | 压缩产物体积**上限**（保险丝），必须小于闸门 |
 | `compress_crf` | `30` | **主控压缩程度**：越小画质越好、体积越大 |
@@ -279,7 +280,8 @@ astrbot_plugin_video_vision/
 
 - 视频以 **inline base64** 传输，因此体积受 provider 超时预算约束；
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
-- 仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为）。
+- 默认仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为）；
+  走 OpenAI 协议的 Gemini 代理需在 `additional_provider_types` 中显式放行。
 - 模型必须声明 **audio** 模态（见上文）。
 - 不支持多视频并行压缩；单条消息的视频串行处理。
 

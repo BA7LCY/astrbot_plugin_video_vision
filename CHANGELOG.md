@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.1.3
+
+- 修复 `build_video_blocks()` 的提前返回只返回 2 元组、导致调用方解包失败
+  （`ValueError: not enough values to unpack (expected 3, got 2)`）的问题；
+  视频不再因此静默不注入
+- 新增 `additional_provider_types` 配置：在默认 Gemini 系白名单之外额外放行
+  指定 provider type（例如走 OpenAI 协议的 Gemini 代理）。留空时行为与之前一致
+
 ## 0.1.2
 
 - 启动日志打印的版本号改为从 `metadata.yaml` 读取，不再硬编码，避免与发布版本脱节
