@@ -76,17 +76,18 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enable` | `true` | 总开关 |
-| `provider_mode` | `openai_compat` | `openai_compat`（默认）/ `gemini_native` |
+| `provider_mode` | `openai_compat` | `openai_compat`（默认）/ `gemini_native`。视觉服务三项没配齐时**自动降级为 `gemini_native`**，因此老配置直接升级不会失效 |
 | `openai_base_url` | `""` | 视觉服务**完整接口地址**，写全到 `/chat/completions` 或 `/responses`（按结尾自动选协议）；只填到 `/v1` 兜底前者 |
 | `openai_api_key` | `""` | 视觉服务密钥 |
 | `openai_model` | `gemini-3.8-flash-high` | 视觉模型，须支持视频 |
-| `openai_timeout_sec` | `180` | 视觉服务超时（上传约 7-9s/MB） |
+| `openai_timeout_sec` | `180` | 视觉服务超时（上传约 7-9s/MB）。既是单阶段超时，也是单个视频的整体硬上限 |
 | `openai_max_tokens` | `2048` | 视觉回答 token 上限 |
 | `vision_with_question` | `true` | 把用户随视频附带的文字一起发给视觉模型 |
 | `vision_describe_prompt` | 见 schema | 无附带文字时的通用描述提示词 |
 | `vision_qa_prompt` | 见 schema | 带问题提示词模板，`{question}` 会被替换 |
 | `vision_verify_ssl` | `true` | 校验视觉服务证书；中转站证书有问题时可关（自担风险） |
 | `require_gemini_provider` | `true` | **仅 gemini_native 模式生效**，建议保持开启 |
+| `additional_provider_types` | `[]` | **仅 gemini_native 模式生效**：在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
 | `max_size_mb` | `13.0` | 体积闸门，超过则按 `oversize_action` 处理 |
 | `compress_max_mb` | `8.0` | 压缩产物体积**上限**（保险丝），必须小于闸门 |
 | `compress_crf` | `30` | **主控压缩程度**：越小画质越好、体积越大 |
@@ -327,8 +328,12 @@ astrbot_plugin_video_vision/
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
 - openai_compat 模式：视觉模型必须是**真能看视频**的模型（如 gemini-3.x-flash 系）；
   主模型拿到的是视觉模型的文字理解而非原片。
-- gemini_native 模式：仅支持 **Gemini 系** provider，且模型必须声明 **audio** 模态。
+- gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），
+  且模型必须声明 **audio** 模态；走 OpenAI 协议的 Gemini 代理需在
+  `additional_provider_types` 中显式放行。
 - 不支持多视频并行压缩；单条消息的视频串行处理（openai_compat 的视觉调用是并发的）。
+- 注入给模型的内容（原生视频块 / 视觉分析文字）都标记为**非持久化**，不会写进对话历史；
+  因此隔一轮再追问视频细节时，模型手上已经没有上一轮的素材。
 
 ## 许可
 

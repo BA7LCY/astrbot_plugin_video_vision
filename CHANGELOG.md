@@ -20,6 +20,31 @@
 - `/videotest` 在 openai_compat 模式下会**真实调用一次视觉服务**，端到端验证配置与网络
 - gemini_native 路径行为完全保留，`require_gemini_provider` 仅对该模式生效
 
+### 合入 #1 时的对接与修复
+
+- 与 0.1.3 的 `build_video_blocks()` **3 元组契约**对齐：第一个元素改为
+  `list[PreparedVideo]`（携带占位符下标 / 文件名 / `VideoInjection`），
+  两种模式共用同一条「探测 → 压缩 → 编码」管线；所有提前返回仍凑满 3 个元素，
+  0.1.3 修过的解包崩溃（`ValueError: not enough values to unpack`）不会回归
+- 0.1.3 新增的 `additional_provider_types` 白名单逃生门在 gemini_native 分支
+  完整保留 —— 切换模式不会把它丢掉
+- **向后兼容**：`provider_mode=openai_compat` 但三项视觉服务配置没配齐时，
+  自动降级为 `gemini_native` 并只告警一次。老配置文件里没有 `provider_mode` 键，
+  否则升级后视频会静默失效
+- 修复视觉服务失败原因被**误分类**：`_short_reason()` 改为按「视觉服务」前缀
+  整体前置判定。此前一次超时的提示文案里带「调小体积闸门」，会被归类成
+  「体积超限」；`_classify_error()` 也不再拿裸 `name` 匹配连接错误
+- 视觉请求增加**整体超时**：`httpx.Timeout` 只管分阶段（连接/写入/读取各算各的），
+  慢速滴灌的端点可以永远碰不到任何一条；现用 `asyncio.wait_for` 给单个视频加硬上限
+- 启动日志里的 API Key 只显示后 4 位，不再露出前 6 位
+
+## 0.1.3
+
+- 修复 `build_video_blocks()` 的提前返回只返回 2 元组、导致调用方解包失败
+  （`ValueError: not enough values to unpack (expected 3, got 2)`）的问题；
+  视频不再因此静默不注入
+- 新增 `additional_provider_types` 配置：在默认 Gemini 系白名单之外额外放行
+  指定 provider type（例如走 OpenAI 协议的 Gemini 代理）。留空时行为与之前一致
 
 ## 0.1.2
 

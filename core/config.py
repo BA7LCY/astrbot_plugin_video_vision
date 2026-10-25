@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 #: 实测经中转站上传约 7-9 秒/MB（原始体积）。13MB 对应约 60-90 秒，
@@ -74,12 +74,29 @@ def _as_choice(value: Any, default: str, choices: tuple[str, ...]) -> str:
     return text if text in choices else default
 
 
+def _as_str_list(value: Any) -> list[str]:
+    """把 WebUI 的 list 配置规范化：去空白、去空项、保序去重。"""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """插件运行配置。所有字段都可由用户在 WebUI 调整。"""
 
     enable: bool = True
     require_gemini_provider: bool = True
+    #: 在 GEMINI_PROVIDER_TYPES 之外额外允许注入视频的 provider type。
+    #: 默认空列表 —— 行为与旧版完全一致。
+    additional_provider_types: list[str] = field(default_factory=list)
     max_size_mb: float = DEFAULT_MAX_SIZE_MB
     compress_max_mb: float = 8.0
     compress_crf: int = 30
@@ -116,6 +133,19 @@ class VideoConfig:
             self.openai_base_url and self.openai_api_key and self.openai_model
         )
 
+    @property
+    def effective_provider_mode(self) -> str:
+        """实际生效的模式。
+
+        ``provider_mode=openai_compat`` 但三要素没配齐时降级为 ``gemini_native``。
+        原因见 ``hooks/llm_request._effective_mode``：老配置文件里没有
+        ``provider_mode`` 键，落到默认值后如果直接跳过注入，升级即等于视频功能
+        静默失效。钩子、启动日志、``/videotest`` 都读这个属性，保证三处一致。
+        """
+        if self.provider_mode == "openai_compat" and not self.openai_service_ready:
+            return "gemini_native"
+        return self.provider_mode
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> VideoConfig:
         """从 WebUI 配置字典构造，容错处理缺失/非法值。"""
@@ -124,6 +154,9 @@ class VideoConfig:
             enable=_as_bool(data.get("enable"), True),
             require_gemini_provider=_as_bool(
                 data.get("require_gemini_provider"), True
+            ),
+            additional_provider_types=_as_str_list(
+                data.get("additional_provider_types")
             ),
             max_size_mb=_as_float(
                 data.get("max_size_mb"), DEFAULT_MAX_SIZE_MB, minimum=0.5

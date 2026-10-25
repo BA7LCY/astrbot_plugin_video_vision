@@ -17,7 +17,7 @@
       "Gemini 原生注入（旧路径）"
     ],
     "default": "openai_compat",
-    "hint": "openai_compat：插件自己调用下方配置的 OpenAI 兼容接口做视频理解，结果以文字注入对话，主对话模型任意。gemini_native：把视频原生注入当前请求，要求主对话 provider 是 Gemini 系。"
+    "hint": "openai_compat：插件自己调用下方配置的 OpenAI 兼容接口做视频理解，结果以文字注入对话，主对话模型任意。gemini_native：把视频原生注入当前请求，要求主对话 provider 是 Gemini 系。注意：选 openai_compat 但下面 base_url / api_key / model 没配齐时，运行时会自动降级为 gemini_native（只告警一次），因此老配置直接升级不会失效。"
   },
   "openai_base_url": {
     "description": "视觉服务接口地址（写全路径）",
@@ -41,7 +41,7 @@
     "description": "视觉服务超时（秒）",
     "type": "float",
     "default": 180.0,
-    "hint": "实测中转站上传约 7-9 秒/MB；闸门 13MB 约需 60-120 秒。超时调太低会导致大视频失败。"
+    "hint": "实测中转站上传约 7-9 秒/MB；闸门 13MB 约需 60-120 秒。超时调太低会导致大视频失败。该值同时是单个视频的**整体**硬上限（不只是分阶段超时），慢速滴灌的端点也会被切断。"
   },
   "openai_max_tokens": {
     "description": "视觉回答 token 上限",
@@ -78,6 +78,13 @@
     "type": "bool",
     "default": true,
     "hint": "仅 gemini_native 模式生效。强烈建议保持开启。本模式借道 audio_url 内容块传输视频，依赖 Gemini provider 的「按 MIME 构造媒体 Part」行为；其他 provider 会把视频当音频处理。openai_compat 模式不关心主对话 provider。"
+  },
+  "additional_provider_types": {
+    "description": "额外允许注入视频的 provider type",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": [],
+    "hint": "仅 gemini_native 模式生效。在默认 Gemini 系白名单之外，额外放行哪些 provider type。例如把走 OpenAI 协议的 Gemini 代理（openai_chat_completion）填进来；填错可导致上游 422（OpenAI 端点会把视频块序列化成 input_audio 并拒收）。留空时行为与旧版完全一致，仅在 require_gemini_provider 开启时作为补充白名单。"
   },
   "max_size_mb": {
     "description": "体积闸门（MB）",

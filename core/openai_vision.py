@@ -31,6 +31,7 @@ Responses 协议，以 ``/chat/completions`` 结尾走 Chat Completions，
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -149,19 +150,33 @@ def _parse_response(kind: str, data: dict) -> tuple[str, int, int]:
 
 
 def _classify_error(exc: Exception) -> str:
-    """把异常翻译成一条不含敏感信息的短原因（写日志/注入给模型都用它）。"""
+    """把异常翻译成一条不含敏感信息的短原因（写日志/注入给模型都用它）。
+
+    返回值统一以「视觉服务」开头。``hooks/llm_request._short_reason`` 依赖这个
+    前缀把这批原因**整体前置判定** —— 否则「可调小体积闸门」里的「闸门」二字
+    会让一次超时被归类成「体积超限」，模型收到的说明就是错的。
+    """
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
     if "certificate" in low or "ssl" in low:
         return (
-            "SSL 证书校验失败（自查证书是否过期；"
+            "视觉服务 SSL 证书校验失败（自查证书是否过期；"
             "确认信任该端点后可在插件配置里关闭 vision_verify_ssl）"
         )
     if "timeout" in low or "timed out" in low:
-        return "请求超时（可调大 openai_timeout_sec 或调小体积闸门）"
-    if "connect" in low or "resolve" in low or "name" in low:
-        return "无法连接视觉服务（检查 openai_base_url 与网络/代理）"
-    return text[:200]
+        return "视觉服务请求超时（可调大 openai_timeout_sec 或调小体积闸门）"
+    # 注意别用裸的 "name" 做匹配：KeyError('name') 这类无关异常会被误判成连接问题。
+    if (
+        "connect" in low
+        or "resolve" in low
+        or "getaddrinfo" in low
+        or "nodename" in low
+        or "name or service not known" in low
+        or "name resolution" in low
+        or "unreachable" in low
+    ):
+        return "视觉服务无法连接（检查 openai_base_url 与网络/代理）"
+    return f"视觉服务调用失败: {text[:180]}"
 
 
 async def analyze_video(
@@ -179,7 +194,9 @@ async def analyze_video(
         import httpx
     except ImportError:
         return VisionResult(
-            False, name, reason="缺少 httpx（AstrBot 官方环境自带，请检查安装）"
+            False,
+            name,
+            reason="视觉服务不可用：缺少 httpx（AstrBot 官方环境自带，请检查安装）",
         )
 
     kind, url = _resolve_endpoint(config.openai_base_url)
@@ -189,13 +206,19 @@ async def analyze_video(
         "Content-Type": "application/json",
     }
 
-    started = time.monotonic()
-    try:
+    async def _post() -> Any:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(config.openai_timeout_sec),
             verify=config.vision_verify_ssl,
         ) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+            return await client.post(url, json=payload, headers=headers)
+
+    started = time.monotonic()
+    try:
+        # httpx 的 Timeout 是**分阶段**上限（连接/写入/读取各算各的），
+        # 一个慢速滴灌的端点可以永远碰不到其中任何一条。这里再加一道整体上限，
+        # 确保单个视频最多占用 openai_timeout_sec，不会把整个请求挂死。
+        resp = await asyncio.wait_for(_post(), timeout=config.openai_timeout_sec)
         elapsed = time.monotonic() - started
     except Exception as exc:  # noqa: BLE001 - 网络异常一律消化
         return VisionResult(
@@ -219,7 +242,7 @@ async def analyze_video(
         analysis, prompt_tok, completion_tok = _parse_response(kind, data)
     except Exception as exc:  # noqa: BLE001
         return VisionResult(
-            False, name, reason=f"响应解析失败: {exc}", elapsed_sec=elapsed
+            False, name, reason=f"视觉服务响应解析失败: {exc}", elapsed_sec=elapsed
         )
 
     if not analysis:
@@ -259,8 +282,6 @@ async def analyze_videos(
         videos: [(文件名, data URI), ...]
         question: 用户随消息附带的文字（可为空串）。
     """
-    import asyncio
-
     prompt = build_vision_prompt(config, question)
     tasks = [
         analyze_video(uri, name, prompt, config=config, logger=logger)

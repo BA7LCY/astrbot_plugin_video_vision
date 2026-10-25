@@ -29,6 +29,13 @@
    part 会 raise ValueError；``ProviderRequest`` 侧两者都接受，用对象两边都安全。
 3. **不要缓存 ``req.extra_user_content_parts`` 的列表引用**。陪伴插件会在多个
    钩子里把它替换成新列表；每次读写都重新取一次属性。
+
+模式降级
+--------
+``openai_compat`` 需要 base_url / api_key / model 三要素。三者没配齐时
+``_effective_mode()`` 会**降级为 gemini_native**，而不是跳过注入：老配置文件里
+没有 ``provider_mode`` 键，落到默认值 ``openai_compat`` 后如果直接跳过，
+升级即等于视频功能静默失效。
 """
 
 from __future__ import annotations
@@ -36,12 +43,13 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from astrbot.api import logger
 
 from ..core.config import VideoConfig
-from ..core.injector import prepare_video
+from ..core.injector import VideoInjection, prepare_video
 from ..core.openai_vision import analyze_videos
 from ..core.placeholder import (
     iter_placeholders,
@@ -68,6 +76,7 @@ _DONE_ATTR = "_video_vision_injected"
 _warned_modality: set[str] = set()
 _warned_gate: set[str] = set()
 _warned_config: set[str] = set()
+_OPENAI_NOT_READY = "openai_compat_not_ready"
 
 
 def _short_reason(reason: str) -> str:
@@ -76,8 +85,23 @@ def _short_reason(reason: str) -> str:
     注意匹配顺序：更具体的原因要排在更宽泛的之前。
     例如「无法读取时长，拒绝盲压缩（体积超闸门）」应归类为时长问题，
     而不是体积问题 —— 否则模型会收到误导性的说明。
+
+    视觉服务（openai_compat）的原因由 ``core/openai_vision._classify_error``
+    统一以「视觉服务」开头，因此**整体前置判定**：那些原因里常带
+    「调小体积闸门」之类的说明文字，若让下面的「闸门」分支先匹配，
+    一次超时会被误报成「体积超限」。
     """
     low = reason.lower()
+    # ---- 视觉服务（openai_compat 模式）----
+    if "视觉服务" in reason:
+        if "ssl" in low or "证书" in reason:
+            return "vision service SSL certificate check failed"
+        if "超时" in reason or "timeout" in low or "timed out" in low:
+            return "the vision service timed out"
+        if "连接" in reason or "connect" in low:
+            return "the vision service is unreachable"
+        return "the vision service returned an error"
+    # ---- 本地视频处理（两种模式共用）----
     if "ffmpeg" in low:
         return "ffmpeg is not available"
     if "不存在" in reason or "not exist" in low or "不是普通文件" in reason:
@@ -88,14 +112,6 @@ def _short_reason(reason: str) -> str:
         return "compression failed"
     if "拒绝" in reason or "闸门" in reason or "too large" in low:
         return "it exceeds the size limit"
-    if "ssl" in low or "证书" in reason:
-        return "vision service SSL certificate check failed"
-    if "超时" in reason or "timeout" in low or "timed out" in low:
-        return "the vision service timed out"
-    if "连接" in reason or "connect" in low:
-        return "the vision service is unreachable"
-    if "http" in low:
-        return "the vision service returned an error"
     return "it could not be processed"
 
 
@@ -139,12 +155,27 @@ def _path_key(path: str) -> str:
         return path
 
 
+@dataclass(frozen=True)
+class PreparedVideo:
+    """一个「已备好、还没交给模型」的视频。
+
+    ``build_video_blocks`` 的第一个返回值是它的列表。之所以不直接返回内容块：
+    两种模式要交给模型的东西不一样 —— ``gemini_native`` 要 ``AudioURLPart``
+    （原始视频），``openai_compat`` 要视觉服务返回的**文字分析**。把「备好的
+    视频」和「怎么送给模型」拆开，两条路才能共用同一条探测/压缩/编码管线。
+    """
+
+    index: int
+    name: str
+    injection: VideoInjection
+
+
 async def build_video_blocks(
     parts: list[Any],
     *,
     config: VideoConfig,
     cache_root: str,
-) -> tuple[list[tuple[int, str, Any]], set[int], list[str]]:
+) -> tuple[list[PreparedVideo], set[int], list[str]]:
     """扫描占位符并准备视频（探测/压缩/编码），两种模式共用这一段管线。
 
     **每个视频的处理都放到线程池执行**。``prepare_video`` 是同步的，内部会跑
@@ -152,9 +183,12 @@ async def build_video_blocks(
     ``max_compress_seconds``（默认 45 秒）的压缩会把整个 AstrBot 卡住 ——
     期间所有会话的消息都不被处理。
 
+    返回形状固定为 **3 元组**，所有提前返回分支也必须凑满三个元素
+    （0.1.3 修过一次漏了第三项的 bug：调用方解包会抛
+    ``ValueError: not enough values to unpack``，视频于是静默不注入）。
+
     Returns:
-        (已备好的视频列表 [(占位符下标, 文件名, VideoInjection), ...],
-         占位符下标集合, 失败原因短语列表)
+        (已备好的视频列表, 成功备好的占位符下标集合, 失败原因短语列表)
     """
     found = iter_placeholders(parts)
     if not found:
@@ -210,7 +244,7 @@ async def build_video_blocks(
             total_found - len(found),
         )
 
-    prepared: list[tuple[int, str, Any]] = []
+    prepared: list[PreparedVideo] = []
     consumed: set[int] = set()
     failures: list[str] = []
     seen_paths: set[str] = set()
@@ -233,7 +267,7 @@ async def build_video_blocks(
         )
         if outcome.ok and outcome.injection is not None:
             inj = outcome.injection
-            prepared.append((index, placeholder.name, inj))
+            prepared.append(PreparedVideo(index, placeholder.name, inj))
             consumed.add(index)
             logger.info(
                 "[VideoVision] 视频已备好: %s | %s | %.2fMB -> %.2fMB | %.1fs | %s%s",
@@ -408,6 +442,23 @@ async def handle_llm_request(plugin: Any, event: Any, req: Any) -> None:
         logger.error("[VideoVision] 注入视频时异常，已跳过: %s", exc, exc_info=True)
 
 
+def _effective_mode(config: VideoConfig) -> str:
+    """决定本次请求实际使用的模式，并在降级时告警一次。
+
+    降级规则本身在 ``VideoConfig.effective_provider_mode`` 里（纯数据、可单测），
+    这里只负责「第一次降级时提醒用户一句」，避免日志刷屏。
+    """
+    mode = config.effective_provider_mode
+    if mode != config.provider_mode and _OPENAI_NOT_READY not in _warned_config:
+        _warned_config.add(_OPENAI_NOT_READY)
+        logger.warning(
+            "[VideoVision] provider_mode=openai_compat，但 openai_base_url / "
+            "openai_api_key / openai_model 未配齐，本次降级为 gemini_native。"
+            "要使用 OpenAI 兼容视觉服务，请把这三项补齐。"
+        )
+    return mode
+
+
 async def _handle(plugin: Any, event: Any, req: Any) -> None:
     config: VideoConfig = getattr(plugin, "config", None) or VideoConfig()
     if not config.enable:
@@ -419,7 +470,7 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     if not iter_placeholders(_parts_of(req)):
         return
 
-    mode = config.provider_mode
+    mode = _effective_mode(config)
     provider_type = "(openai_compat)"
 
     if mode == "gemini_native":
@@ -427,17 +478,26 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
         provider_config = getattr(provider, "provider_config", None) or {}
         provider_type = str(provider_config.get("type") or "")
 
-        # ---- 闸门 1：必须是 Gemini 系 provider ----
+        # ---- 闸门 1：必须是 Gemini 系 provider（可配置额外放行）----
+        allowed_provider_types = GEMINI_PROVIDER_TYPES | set(
+            config.additional_provider_types
+        )
         if (
             config.require_gemini_provider
-            and provider_type not in GEMINI_PROVIDER_TYPES
+            and provider_type not in allowed_provider_types
         ):
+            logger.debug(
+                "[VideoVision] provider 类型 %r 不在允许列表 %s 中，跳过视频注入",
+                provider_type or "(未知)",
+                sorted(allowed_provider_types),
+            )
             if provider_type not in _warned_gate:
                 _warned_gate.add(provider_type)
                 logger.warning(
                     "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，已跳过视频注入。"
                     "若该 provider 同样支持按 MIME 构造媒体 Part，"
-                    "可在插件配置里关闭 require_gemini_provider。",
+                    "可在插件配置里关闭 require_gemini_provider，"
+                    "或在 additional_provider_types 中放行该类型。",
                     provider_type or "(未知)",
                 )
             return
@@ -456,17 +516,10 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
                     provider_config.get("id") or provider_type,
                 )
             return
-    else:
-        # ---- openai_compat：只校验视觉服务三要素，不关心主对话 provider ----
-        if not config.openai_service_ready:
-            key = "openai_compat_not_ready"
-            if key not in _warned_config:
-                _warned_config.add(key)
-                logger.warning(
-                    "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
-                    "openai_api_key / openai_model 未配齐，视频注入已跳过。"
-                )
-            return
+    elif not config.openai_service_ready:
+        # _effective_mode() 已把「没配齐」降级成 gemini_native，正常走不到这里。
+        # 保留判断是为了防御后续改动让它变成静默发错内容。
+        return
 
     setattr(req, _DONE_ATTR, True)
 
@@ -480,55 +533,58 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
             provider_type,
             len(iter_placeholders(_parts_of(req))),
         )
-    prepared, _, failures = await build_video_blocks(
+    prepared, consumed, failures = await build_video_blocks(
         _parts_of(req), config=config, cache_root=cache_root
     )
 
     # ---- 模式分支：原生注入 vs 视觉服务理解 ----
+    # ``consumed`` = 已成功备好（压缩/编码完成）的占位符下标；
+    # ``done``     = 已成功交给模型的占位符下标。
+    # 两者在 gemini_native 下相同；openai_compat 下若视觉调用失败，占位符必须
+    # 保留原样（那时本地路径反而有用），所以不能直接用 consumed。
     blocks: list[Any] = []
-    done_indices: set[int] = set()
+    done: set[int] = set()
 
     if mode == "gemini_native":
-        for index, _name, inj in prepared:
-            blocks.append(_temp_video_part(inj.data_uri))
-            done_indices.add(index)
-    else:
-        if prepared:
-            question = _extract_question(event, req)
-            if config.debug_log:
-                logger.info(
-                    "[VideoVision][debug] 视觉服务调用 | 视频=%d 附带问题=%s",
-                    len(prepared),
-                    (question[:80] + "…") if len(question) > 80 else (question or "(无)"),
-                )
-            results = await analyze_videos(
-                [(name, inj.data_uri) for _i, name, inj in prepared],
-                question,
-                config=config,
-                logger=logger,
+        for item in prepared:
+            blocks.append(_temp_video_part(item.injection.data_uri))
+        done = set(consumed)
+    elif prepared:
+        question = _extract_question(event, req)
+        if config.debug_log:
+            logger.info(
+                "[VideoVision][debug] 视觉服务调用 | 视频=%d 附带问题=%s",
+                len(prepared),
+                (question[:80] + "…") if len(question) > 80 else (question or "(无)"),
             )
-            for (index, name, _inj), result in zip(prepared, results):
-                if result.ok:
-                    blocks.append(
-                        _temp_text_part(
-                            _wrap_vision_analysis(
-                                name, result.analysis, config.openai_model
-                            )
+        results = await analyze_videos(
+            [(item.name, item.injection.data_uri) for item in prepared],
+            question,
+            config=config,
+            logger=logger,
+        )
+        for item, result in zip(prepared, results):
+            if result.ok:
+                blocks.append(
+                    _temp_text_part(
+                        _wrap_vision_analysis(
+                            item.name, result.analysis, config.openai_model
                         )
                     )
-                    done_indices.add(index)
-                else:
-                    failures.append(_short_reason(result.reason))
-                    logger.warning(
-                        "[VideoVision] 视觉理解失败: %s | %s", name, result.reason
-                    )
+                )
+                done.add(item.index)
+            else:
+                failures.append(_short_reason(result.reason))
+                logger.warning(
+                    "[VideoVision] 视觉理解失败: %s | %s", item.name, result.reason
+                )
 
     # ---- 重新读取后再写入，避免期间列表被替换 ----
     target = _parts_of(req)
     if blocks:
         # 处理成功后抹掉占位文本里的本机路径，避免诱导模型自己去跑 Python/cv2
         if config.hide_local_path:
-            changed = _neutralize_placeholders(target, done_indices, mode=mode)
+            changed = _neutralize_placeholders(target, done, mode=mode)
             if changed and config.debug_log:
                 logger.info(
                     "[VideoVision][debug] 已抹除 %d 处占位文本中的本机路径", changed

@@ -129,13 +129,12 @@ class VideoVisionPlugin(Star):
             ffprobe or "未找到",
             self.cache_root if self.config.cache_enabled else "已关闭",
         )
-        if self.config.provider_mode == "openai_compat":
+        effective_mode = self.config.effective_provider_mode
+        if effective_mode == "openai_compat":
             key = self.config.openai_api_key
-            masked = (
-                f"{key[:6]}...{key[-4:]}"
-                if len(key) > 12
-                else ("已配置" if key else "未配置")
-            )
+            # 只露后 4 位。密钥是敏感信息，日志经常被贴到 issue 里，
+            # 前 6 位足以还原出「sk-xxx」这类前缀，没必要泄露。
+            masked = f"…{key[-4:]}" if len(key) >= 8 else ("已配置" if key else "未配置")
             logger.info(
                 "[VideoVision] 模式=openai_compat | 视觉服务=%s | 模型=%s | key=%s | 超时=%.0fs",
                 self.config.openai_base_url or "未配置",
@@ -143,15 +142,17 @@ class VideoVisionPlugin(Star):
                 masked,
                 self.config.openai_timeout_sec,
             )
-            if not self.config.openai_service_ready:
-                logger.warning(
-                    "[VideoVision] 当前为 openai_compat 模式，但 openai_base_url / "
-                    "openai_api_key / openai_model 未配齐，视频功能不可用。"
-                )
         else:
             logger.info(
                 "[VideoVision] 模式=gemini_native | 仅 Gemini provider=%s",
                 self.config.require_gemini_provider,
+            )
+        if self.config.provider_mode != effective_mode:
+            logger.warning(
+                "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
+                "openai_api_key / openai_model 未配齐，已降级为 gemini_native "
+                "（老配置零改动仍可继续用）。要使用 OpenAI 兼容视觉服务，"
+                "请把这三项补齐。"
             )
         if not ffmpeg:
             logger.warning(
@@ -266,6 +267,13 @@ class VideoVisionPlugin(Star):
             f"CRF={cfg.compress_crf} "
             f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
         )
+        # 用与钩子完全相同的判定，避免 /videotest 说的和实际跑的不一样
+        effective_mode = cfg.effective_provider_mode
+        degraded = cfg.provider_mode != effective_mode
+        lines.append(
+            f"模式   : {effective_mode}"
+            + ("（openai_compat 三项未配齐，运行时降级）" if degraded else "")
+        )
 
         oversize = size_mb > cfg.max_size_mb
         overlong = cfg.max_duration_sec > 0 and duration > cfg.max_duration_sec
@@ -298,7 +306,7 @@ class VideoVisionPlugin(Star):
         inj = outcome.injection
         uri_mb = len(inj.block["audio_url"]["url"]) / 1024 / 1024
         est_upload = inj.size_mb * 8  # 实测约 7-9 秒/MB
-        is_openai = cfg.provider_mode == "openai_compat"
+        is_openai = effective_mode == "openai_compat"
         budget = cfg.openai_timeout_sec if is_openai else 180.0
         budget_name = "视觉服务预算" if is_openai else "provider 预算"
 
@@ -321,29 +329,26 @@ class VideoVisionPlugin(Star):
         # openai_compat：真实调用一次视觉服务，端到端验证配置与网络
         if is_openai:
             lines.append("")
-            if not cfg.openai_service_ready:
-                lines.append("❌ 未配齐 openai_base_url / openai_api_key / openai_model")
-            else:
-                prompt = build_vision_prompt(cfg, "")
-                result = await analyze_video(
-                    inj.data_uri,
-                    os.path.basename(target),
-                    prompt,
-                    config=cfg,
-                    logger=logger,
+            prompt = build_vision_prompt(cfg, "")
+            result = await analyze_video(
+                inj.data_uri,
+                os.path.basename(target),
+                prompt,
+                config=cfg,
+                logger=logger,
+            )
+            if result.ok:
+                lines.append(
+                    f"✅ 视觉调用成功（{result.elapsed_sec:.1f}s | "
+                    f"token {result.prompt_tokens}+{result.completion_tokens}）"
                 )
-                if result.ok:
-                    lines.append(
-                        f"✅ 视觉调用成功（{result.elapsed_sec:.1f}s | "
-                        f"token {result.prompt_tokens}+{result.completion_tokens}）"
-                    )
-                    excerpt = result.analysis[:400] + (
-                        "…" if len(result.analysis) > 400 else ""
-                    )
-                    lines.append("— 视觉模型回复节选 —")
-                    lines.append(excerpt)
-                else:
-                    lines.append(f"❌ 视觉调用失败: {result.reason}")
+                excerpt = result.analysis[:400] + (
+                    "…" if len(result.analysis) > 400 else ""
+                )
+                lines.append("— 视觉模型回复节选 —")
+                lines.append(excerpt)
+            else:
+                lines.append(f"❌ 视觉调用失败: {result.reason}")
         return "\n".join(lines)
 
     async def terminate(self) -> None:
