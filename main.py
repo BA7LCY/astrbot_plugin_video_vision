@@ -134,7 +134,9 @@ class VideoVisionPlugin(Star):
             key = self.config.openai_api_key
             # 只露后 4 位。密钥是敏感信息，日志经常被贴到 issue 里，
             # 前 6 位足以还原出「sk-xxx」这类前缀，没必要泄露。
-            masked = f"…{key[-4:]}" if len(key) >= 8 else ("已配置" if key else "未配置")
+            masked = f"…{key[-4:]}" if len(key) >= 8 else ""
+            if not masked:
+                masked = "已配置" if key else "未配置"
             logger.info(
                 "[VideoVision] 模式=openai_compat | 视觉服务=%s | 模型=%s | key=%s | 超时=%.0fs",
                 self.config.openai_base_url or "未配置",
