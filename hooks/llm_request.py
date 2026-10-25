@@ -381,7 +381,11 @@ def _extract_question(event: Any, req: Any) -> str:
 
     依次尝试：event.get_message_str() -> event.message_str -> req.prompt
     -> req.contexts 里最后一条 user 文本。附件占位行会被剔除，
-    避免把「[Video Attachment: ...]」当作用户问题带给视觉模型。
+    避免把「[Video Attachment: ...]」（**含本机路径**）当作用户问题带给外部
+    视觉服务 —— 那等于把本机路径泄露给第三方端点。
+
+    注意 contexts 分支必须在**分段级别**过滤：那里多个 TextPart 会被空格拼成
+    一行，拼完之后占位符就不在行首了，只按行首过滤会漏掉。
     """
     text = ""
     getter = getattr(event, "get_message_str", None)
@@ -409,11 +413,17 @@ def _extract_question(event: Any, req: Any) -> str:
                     text = content
                     break
                 if isinstance(content, list):
-                    text = " ".join(
-                        str(part.get("text") or "")
-                        for part in content
-                        if isinstance(part, Mapping) and part.get("type") == "text"
-                    )
+                    chunks: list[str] = []
+                    for part in content:
+                        if not isinstance(part, Mapping):
+                            continue
+                        if part.get("type") != "text":
+                            continue
+                        piece = str(part.get("text") or "").strip()
+                        if not piece or piece.startswith(_ATTACHMENT_PREFIXES):
+                            continue  # 整段就是附件占位符，直接丢
+                        chunks.append(piece)
+                    text = " ".join(chunks)
                     break
         except Exception:  # noqa: BLE001
             pass
